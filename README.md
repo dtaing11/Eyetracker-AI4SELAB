@@ -29,7 +29,7 @@ The plugin launches a Dockerized Python backend for gaze tracking, streams gaze 
 
 ---
 
-## 🧑‍💻 Contributing
+## Contributing
 
 Contributions are welcome! Please follow these steps:
 
