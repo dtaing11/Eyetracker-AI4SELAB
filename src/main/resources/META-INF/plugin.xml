@@ -1,0 +1,42 @@
+<idea-plugin>
+    <id>org.dinataing.eyetrackingai4selab.eyetracking</id>
+    <name>AI4SE Eye Tracking</name>
+    <version>1.0.0</version>
+    <vendor email="dinataing@lsu.edu">AI4SE Lab @ LSU</vendor>
+
+    <description>
+        AI4SE Lab plugin for starting, pausing, and configuring eye-tracking capture inside JetBrains IDEs.
+    </description>
+
+    <depends>com.intellij.modules.platform</depends>
+
+    <actions>
+        <!-- Start / Stop Tracking -->
+        <action id="AI4SE.StartStopTracking"
+                class="org.dinataing.eyetrackingai4selab.actions.StartStopTrackingAction"
+                text="Start Tracking"
+                description="Start or stop gaze tracking"
+                icon="AllIcons.Actions.ToggleVisibility">
+            <add-to-group group-id="ToolsMenu" anchor="first"/>
+        </action>
+
+        <!-- Pause / Resume Tracking -->
+        <action id="AI4SE.PauseResumeTracking"
+                class="org.dinataing.eyetrackingai4selab.actions.PauseResumeTrackingAction"
+                text="Pause Tracking"
+                description="Pause or resume gaze tracking">
+            <add-to-group group-id="ToolsMenu"
+                          anchor="after"
+                          relative-to-action="AI4SE.StartStopTracking"/>
+        </action>
+        <!-- Add Label popup -->
+        <group id="AI4SE.AddLabelActionGroup"
+               class="org.dinataing.eyetrackingai4selab.actions.AddLabelActionGroup"
+               text="Add Label"
+               description="Add label"
+               popup="true"
+               icon="AllIcons.Actions.Edit">
+            <add-to-group group-id="EditorPopupMenu" anchor="first"/>
+        </group>
+    </actions>
+</idea-plugin>
