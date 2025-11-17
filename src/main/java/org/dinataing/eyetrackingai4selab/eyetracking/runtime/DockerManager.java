@@ -46,6 +46,7 @@ public final class DockerManager implements Disposable {
                     startOrBuildAndStart(); // runs off-EDT here
                 } catch (Exception ex) {
                     LOG.warn("AI4SE start failed", ex);
+                    System.err.println("[AI4SE] Start failed: " + ex.getMessage());
                 }
             }
         });
@@ -77,7 +78,6 @@ public final class DockerManager implements Disposable {
         Path ctx = ResourceExtractor.stageDockerContext(DockerManager.class);
 
         // IMPORTANT: include the actual staged file names in the content hash.
-        // If your entry script is eyetracker.py (not main.py), keep it here and in your Dockerfile CMD.
         String contentHash = ResourceExtractor
                 .sha256(ctx, List.of("Dockerfile", "requirements.txt", "eyetracker.py"))
                 .substring(0, 12);
@@ -86,16 +86,19 @@ public final class DockerManager implements Disposable {
         // Build image if missing
         if (!imageExists(imageTag)) {
             LOG.info("[AI4SE] building image " + imageTag);
+            System.out.println("[AI4SE] Building Docker image: " + imageTag);
             runAndCheckWithLogs(
                     new ProcessBuilder("docker", "build", "-t", imageTag, ctx.toString()),
                     "[AI4SE Build] "
             );
         } else {
             LOG.info("[AI4SE] image already present: " + imageTag);
+            System.out.println("[AI4SE] Image already present: " + imageTag);
         }
 
         if (isRunning()) {
             LOG.info("[AI4SE] container already running.");
+            System.out.println("[AI4SE] Container already running.");
             return;
         }
 
@@ -107,25 +110,41 @@ public final class DockerManager implements Disposable {
                     .waitFor(3, TimeUnit.SECONDS);
         } catch (Exception ignored) {}
 
-        // Pick a free host port and map -> container:5000
-        hostPort = findFreePort();
+        // Decide how to run Docker based on OS (Linux vs others)
+        String os = System.getProperty("os.name").toLowerCase();
+        List<String> cmd;
 
-        // Run container
-        List<String> cmd = Arrays.asList(
-                "docker", "run", "--rm",
-                "--name", CONTAINER_NAME,
-                "-p", hostPort + ":" + CONTAINER_PORT,
-                imageTag
-        );
+        if (os.contains("linux")) {
+            // On Linux: host networking helps Tobii discovery
+            cmd = Arrays.asList(
+                    "docker", "run", "--rm",
+                    "--name", CONTAINER_NAME,
+                    "--network=host",
+                    imageTag
+            );
+            hostPort = CONTAINER_PORT;
+            System.out.println("[AI4SE] Starting tracker with --network=host on Linux");
+        } else {
+            hostPort = findFreePort();
+            cmd = Arrays.asList(
+                    "docker", "run", "--rm",
+                    "--name", CONTAINER_NAME,
+                    "-p", hostPort + ":" + CONTAINER_PORT,
+                    imageTag
+            );
+            System.out.println("[AI4SE] Starting tracker with -p " + hostPort + ":" + CONTAINER_PORT);
+        }
+
         String commandLine = String.join(" ", cmd);
-
         ProcessBuilder pb = new ProcessBuilder(cmd);
         pb.redirectErrorStream(true);
         runProcess = pb.start();
 
+        System.out.println("[AI4SE] Container starting with: " + commandLine);
+        System.out.println("[AI4SE] Tracker mapped to http://localhost:" + hostPort);
+
         // Capture logs and JSON messages safely
         startWithHandler(runProcess, commandLine, "[AI4SE Docker] ");
-        LOG.info("[AI4SE] container starting, mapped to http://localhost:" + hostPort);
     }
 
     public synchronized void stop() {
@@ -141,6 +160,7 @@ public final class DockerManager implements Disposable {
             new ProcessBuilder("docker", "stop", CONTAINER_NAME).start();
         } catch (IOException ignored) {}
         hostPort = -1;
+        System.out.println("[AI4SE] Tracker stopped.");
     }
 
     // -------------------- Process/log wiring --------------------
@@ -156,7 +176,11 @@ public final class DockerManager implements Disposable {
             @Override
             public void onTextAvailable(ProcessEvent event, Key outputType) {
                 String t = event.getText();
-                if (t != null) LOG.info(prefix + t.trim());
+                if (t != null) {
+                    String line = t.trim();
+                    LOG.info(prefix + line);
+                    System.out.println(prefix + line);
+                }
             }
         });
         handler.startNotify();
@@ -174,29 +198,105 @@ public final class DockerManager implements Disposable {
         runHandler.addProcessListener(new ProcessAdapter() {
             @Override
             public void onTextAvailable(ProcessEvent event, Key outputType) {
-                String line = event.getText();
-                if (line == null) return;
-                line = line.trim();
+                String raw = event.getText();
+                if (raw == null) return;
+                String line = raw.trim();
 
-                // Detect JSON messages (from Python stdout)
+                // Always echo raw line to console so you SEE something
+                System.out.println("[AI4SE Python RAW] " + line);
+
+                // Detect JSON messages from Python stdout
                 if (line.startsWith("{") && line.endsWith("}")) {
                     try {
                         JSONObject obj = new JSONObject(line);
-                        double x = obj.optDouble("eyeX", Double.NaN);
-                        double y = obj.optDouble("eyeY", Double.NaN);
-                        // Thread-safe UI update hook
-                        SwingUtilities.invokeLater(() -> updateUi(x, y));
+                        String type = obj.optString("type", "");
+
+                        switch (type) {
+                            case "gaze": {
+                                // New schema from your Python:
+                                // leftX, leftY, leftValidity, leftPupil, leftPupilValidity,
+                                // rightX, rightY, rightValidity, rightPupil, rightPupilValidity
+                                double leftX  = obj.optDouble("leftX", Double.NaN);
+                                double leftY  = obj.optDouble("leftY", Double.NaN);
+                                double rightX = obj.optDouble("rightX", Double.NaN);
+                                double rightY = obj.optDouble("rightY", Double.NaN);
+
+                                int leftValidity  = obj.optInt("leftValidity", -1);
+                                int rightValidity = obj.optInt("rightValidity", -1);
+
+                                // Simple strategy: average valid eyes, or fall back to whichever is valid
+                                double gx = Double.NaN;
+                                double gy = Double.NaN;
+
+                                boolean leftValid  = !Double.isNaN(leftX)  && !Double.isNaN(leftY);
+                                boolean rightValid = !Double.isNaN(rightX) && !Double.isNaN(rightY);
+
+                                if (leftValid && rightValid) {
+                                    gx = (leftX + rightX) / 2.0;
+                                    gy = (leftY + rightY) / 2.0;
+                                } else if (leftValid) {
+                                    gx = leftX;
+                                    gy = leftY;
+                                } else if (rightValid) {
+                                    gx = rightX;
+                                    gy = rightY;
+                                }
+
+                                double ts = obj.optDouble("timestamp", Double.NaN);
+
+                                LOG.info(String.format(
+                                        "[AI4SE] Gaze frame ts=%.0f left=(%.3f, %.3f, v=%d) right=(%.3f, %.3f, v=%d) -> avg=(%.3f, %.3f)",
+                                        ts, leftX, leftY, leftValidity, rightX, rightY, rightValidity, gx, gy
+                                ));
+                                System.out.println(String.format(
+                                        "[AI4SE] Gaze frame ts=%.0f left=(%.3f, %.3f) right=(%.3f, %.3f) -> avg=(%.3f, %.3f)",
+                                        ts, leftX, leftY, rightX, rightY, gx, gy
+                                ));
+
+                                double finalGx = gx;
+                                double finalGy = gy;
+
+                                // Thread-safe UI update hook
+                                SwingUtilities.invokeLater(() -> updateUi(finalGx, finalGy));
+                                break;
+                            }
+
+                            case "status": {
+                                String status = obj.optString("status", "unknown");
+                                LOG.info("[AI4SE] Status from Python: " + status + " -> " + obj);
+                                System.out.println("[AI4SE] Status: " + status + " -> " + obj);
+                                break;
+                            }
+
+                            case "error": {
+                                String errorType = obj.optString("errorType", "unknown_error");
+                                String msg = obj.optString("message", "");
+                                LOG.warn("[AI4SE] Error from Python: " + errorType + " -> " + obj);
+                                System.err.println("[AI4SE] Python error: " + errorType + " -> " + msg);
+                                break;
+                            }
+
+                            default: {
+                                LOG.info("[AI4SE] Unknown JSON type: " + type + " -> " + obj);
+                                System.out.println("[AI4SE] Unknown JSON type: " + type + " -> " + obj);
+                                break;
+                            }
+                        }
                     } catch (Exception e) {
                         LOG.debug("Failed to parse JSON line: " + line, e);
+                        System.err.println("[AI4SE] Failed to parse JSON: " + line);
                     }
                 } else {
+                    // Non-JSON output from container
                     LOG.info(prefix + line);
+                    System.out.println(prefix + line);
                 }
             }
 
             @Override
             public void processTerminated(ProcessEvent event) {
                 LOG.info(prefix + "terminated with exit code " + event.getExitCode());
+                System.out.println(prefix + "terminated with exit code " + event.getExitCode());
             }
         });
 
@@ -241,10 +341,11 @@ public final class DockerManager implements Disposable {
 
     // -------------------- UI hook (replace with your Tool Window update) --------------------
 
+    /** Receives normalized averaged gaze (0..1 on display) */
     private void updateUi(double x, double y) {
-        LOG.info(String.format("[AI4SE] Gaze: x=%.3f  y=%.3f", x, y));
-        // For dev only; remove if you don't want console spam during runIde:
-        System.out.println("[AI4SE] Gaze: x=" + x + " y=" + y);
+        LOG.info(String.format("[AI4SE] Gaze avg: x=%.3f  y=%.3f", x, y));
+        System.out.println("[AI4SE] Gaze avg: x=" + x + " y=" + y);
+        // TODO: hook this into your ToolWindow instead of just logging
     }
 
     // -------------------- Disposable --------------------
