@@ -1,3 +1,109 @@
+/*
+PEP8-style review for DockerManager (Java code; style notes adapted from Python conventions)
+
+- Line length:
+  Several lines are quite long (e.g., long ProcessBuilder commands, log strings,
+  and method calls). In PEP8 spirit, try to keep lines ≤ 79–99 characters by
+  breaking arguments across multiple lines.
+
+- Function/class documentation:
+  Public methods such as:
+    - startOrBuildAndStartAsync(Project project)
+    - stopAsync(Project project)
+    - startOrBuildAndStart()
+    - stop()
+    - isRunning()
+    - getHostPort()
+  would benefit from explicit Javadoc describing behavior, threading model
+  (EDT vs background), side effects, and error conditions.
+
+- Method naming & responsibility:
+  The method name `startOrBuildAndStart` is a bit redundant and long.
+  Consider a clearer name like `ensureContainerRunning` or splitting it into:
+    - buildImageIfNeeded()
+    - startContainer()
+    - ensureDockerEnvironment()
+  to respect single-responsibility and improve testability.
+
+- Long / multi-purpose methods:
+  `startOrBuildAndStart()` currently:
+    * verifies Docker is installed,
+    * stages the Docker context,
+    * computes a hash,
+    * checks/creates an image,
+    * removes stale containers,
+    * chooses a port and OS-specific networking modes,
+    * starts the container,
+    * wires process logs and JSON parsing.
+  This is a lot of behavior for one method. In PEP8 spirit, consider extracting
+  smaller private helpers for each logical step.
+
+- Exception handling:
+  There are several `catch (Exception ignored)` / `catch (IOException ignored)`
+  blocks that swallow errors silently. PEP8 (and good style generally) advises
+  against catching broad exceptions without at least minimal logging.
+  Consider logging at DEBUG level instead of completely ignoring these errors.
+
+- Logging vs printing:
+  The code mixes:
+    - LOG.info / LOG.warn / LOG.debug
+    - System.out.println / System.err.println
+  PEP8 would encourage a single consistent logging mechanism. Prefer the
+  structured logger (`LOG`) everywhere unless console output is explicitly
+  desired for development/debugging only.
+
+- Magic strings and JSON keys:
+  JSON keys like "type", "gaze", "status", "error", "eyeX", "eyeY",
+  "timestamp", "errorType" are used as inline string literals.
+  Consider extracting them as `private static final String` constants to avoid
+  typos and to make refactoring safer.
+
+- OS-specific behavior:
+  The Linux branch uses `--network=host` and sets `hostPort = CONTAINER_PORT`,
+  while non-Linux uses `-p hostPort:CONTAINER_PORT`.
+  Add a brief comment documenting why host networking is required on Linux
+  (e.g., Tobii discovery / device visibility) and why this differs on
+  macOS/Windows.
+
+- Process lifecycle and cleanup:
+  `stop()` calls `runProcess.destroy()` and waits up to 5 seconds. To be more
+  robust, consider falling back to `destroyForcibly()` if the process does not
+  terminate in time, and log any failures in the Docker `stop` call instead of
+  swallowing them.
+
+- JSON parsing responsibilities:
+  The `onTextAvailable` listener handles:
+    * echoing raw log lines,
+    * detecting JSON vs non-JSON,
+    * parsing JSON,
+    * dispatching per-type logic (gaze/status/error).
+  Consider extracting the JSON-specific logic into helpers like:
+    * handleJsonLine(String line)
+    * handleGaze(JSONObject obj)
+    * handleStatus(JSONObject obj)
+    * handleError(JSONObject obj)
+  This will keep the listener simpler and easier to read.
+
+- UI hook:
+  `updateUi(double x, double y)` currently only logs the gaze coordinates.
+  Add a clear TODO comment about how this is intended to integrate with the
+  actual ToolWindow / UI so future maintainers understand its purpose.
+
+- ResourceExtractor usage:
+  The call to `ResourceExtractor.sha256(...)` with specific filenames is good
+  for cache-busting. Consider documenting that changing any of those files
+  will produce a new Docker image tag, which is important for reproducibility.
+
+Overall:
+  The class is conceptually well-structured and readable, but it would benefit
+  from:
+    - smaller, single-purpose private helpers,
+    - consistent logging,
+    - less exception swallowing,
+    - constants for shared strings,
+    - clearer documentation around threading and OS-specific behavior.
+*/
+
 package org.dinataing.eyetrackingai4selab.eyetracking.runtime;
 
 import com.intellij.execution.process.OSProcessHandler;
@@ -46,6 +152,7 @@ public final class DockerManager implements Disposable {
                     startOrBuildAndStart(); // runs off-EDT here
                 } catch (Exception ex) {
                     LOG.warn("AI4SE start failed", ex);
+                    System.err.println("[AI4SE] Start failed: " + ex.getMessage());
                 }
             }
         });
@@ -77,7 +184,6 @@ public final class DockerManager implements Disposable {
         Path ctx = ResourceExtractor.stageDockerContext(DockerManager.class);
 
         // IMPORTANT: include the actual staged file names in the content hash.
-        // If your entry script is eyetracker.py (not main.py), keep it here and in your Dockerfile CMD.
         String contentHash = ResourceExtractor
                 .sha256(ctx, List.of("Dockerfile", "requirements.txt", "eyetracker.py"))
                 .substring(0, 12);
@@ -86,16 +192,19 @@ public final class DockerManager implements Disposable {
         // Build image if missing
         if (!imageExists(imageTag)) {
             LOG.info("[AI4SE] building image " + imageTag);
+            System.out.println("[AI4SE] Building Docker image: " + imageTag);
             runAndCheckWithLogs(
                     new ProcessBuilder("docker", "build", "-t", imageTag, ctx.toString()),
                     "[AI4SE Build] "
             );
         } else {
             LOG.info("[AI4SE] image already present: " + imageTag);
+            System.out.println("[AI4SE] Image already present: " + imageTag);
         }
 
         if (isRunning()) {
             LOG.info("[AI4SE] container already running.");
+            System.out.println("[AI4SE] Container already running.");
             return;
         }
 
@@ -111,21 +220,45 @@ public final class DockerManager implements Disposable {
         hostPort = findFreePort();
 
         // Run container
-        List<String> cmd = Arrays.asList(
-                "docker", "run", "--rm",
-                "--name", CONTAINER_NAME,
-                "-p", hostPort + ":" + CONTAINER_PORT,
-                imageTag
-        );
+        // Decide how to run Docker based on OS
+        String os = System.getProperty("os.name").toLowerCase();
+        List<String> cmd;
+
+        if (os.contains("linux")) {
+            // On Linux: use host networking so Tobii discovery can see the device
+            cmd = Arrays.asList(
+                    "docker", "run", "--rm",
+                    "--name", CONTAINER_NAME,
+                    "--network=host",
+                    imageTag
+            );
+
+            hostPort = CONTAINER_PORT;
+
+            System.out.println("[AI4SE] Starting tracker with --network=host on Linux");
+        } else {
+            // Fallback for macOS/Windows: keep the old port-mapping way
+            hostPort = findFreePort();
+            cmd = Arrays.asList(
+                    "docker", "run", "--rm",
+                    "--name", CONTAINER_NAME,
+                    "-p", hostPort + ":" + CONTAINER_PORT,
+                    imageTag
+            );
+            System.out.println("[AI4SE] Starting tracker with -p " + hostPort + ":" + CONTAINER_PORT);
+        }
+
         String commandLine = String.join(" ", cmd);
 
         ProcessBuilder pb = new ProcessBuilder(cmd);
         pb.redirectErrorStream(true);
         runProcess = pb.start();
 
+        System.out.println("[AI4SE] Container starting with: " + commandLine);
+        System.out.println("[AI4SE] Tracker mapped to http://localhost:" + hostPort);
+
         // Capture logs and JSON messages safely
         startWithHandler(runProcess, commandLine, "[AI4SE Docker] ");
-        LOG.info("[AI4SE] container starting, mapped to http://localhost:" + hostPort);
     }
 
     public synchronized void stop() {
@@ -141,6 +274,7 @@ public final class DockerManager implements Disposable {
             new ProcessBuilder("docker", "stop", CONTAINER_NAME).start();
         } catch (IOException ignored) {}
         hostPort = -1;
+        System.out.println("[AI4SE] Tracker stopped.");
     }
 
     // -------------------- Process/log wiring --------------------
@@ -156,7 +290,11 @@ public final class DockerManager implements Disposable {
             @Override
             public void onTextAvailable(ProcessEvent event, Key outputType) {
                 String t = event.getText();
-                if (t != null) LOG.info(prefix + t.trim());
+                if (t != null) {
+                    String line = t.trim();
+                    LOG.info(prefix + line);
+                    System.out.println(prefix + line);
+                }
             }
         });
         handler.startNotify();
@@ -174,29 +312,62 @@ public final class DockerManager implements Disposable {
         runHandler.addProcessListener(new ProcessAdapter() {
             @Override
             public void onTextAvailable(ProcessEvent event, Key outputType) {
-                String line = event.getText();
-                if (line == null) return;
-                line = line.trim();
+                String raw = event.getText();
+                if (raw == null) return;
+                String line = raw.trim();
 
-                // Detect JSON messages (from Python stdout)
+                // Always echo raw line to console so you SEE something
+                System.out.println("[AI4SE Python RAW] " + line);
+
+                // Detect JSON messages from Python stdout
                 if (line.startsWith("{") && line.endsWith("}")) {
                     try {
                         JSONObject obj = new JSONObject(line);
-                        double x = obj.optDouble("eyeX", Double.NaN);
-                        double y = obj.optDouble("eyeY", Double.NaN);
-                        // Thread-safe UI update hook
-                        SwingUtilities.invokeLater(() -> updateUi(x, y));
+                        String type = obj.optString("type", "");
+
+                        switch (type) {
+                            case "gaze": {
+                                double x = obj.optDouble("eyeX", Double.NaN);
+                                double y = obj.optDouble("eyeY", Double.NaN);
+                                double ts = obj.optDouble("timestamp", Double.NaN);
+
+                                // Thread-safe UI update hook
+                                SwingUtilities.invokeLater(() -> updateUi(x, y));
+                                break;
+                            }
+                            case "status": {
+                                String status = obj.optString("status", "unknown");
+                                LOG.info("[AI4SE] Status from Python: " + status + " -> " + obj);
+                                System.out.println("[AI4SE] Status: " + status + " -> " + obj);
+                                break;
+                            }
+                            case "error": {
+                                String errorType = obj.optString("errorType", "unknown_error");
+                                LOG.warn("[AI4SE] Error from Python: " + errorType + " -> " + obj);
+                                System.err.println("[AI4SE] Python error: " + errorType + " -> " + obj);
+                                break;
+                            }
+                            default: {
+                                LOG.info("[AI4SE] Unknown JSON type: " + type + " -> " + obj);
+                                System.out.println("[AI4SE] Unknown JSON type: " + type + " -> " + obj);
+                                break;
+                            }
+                        }
                     } catch (Exception e) {
                         LOG.debug("Failed to parse JSON line: " + line, e);
+                        System.err.println("[AI4SE] Failed to parse JSON: " + line);
                     }
                 } else {
+                    // Non-JSON output from container
                     LOG.info(prefix + line);
+                    System.out.println(prefix + line);
                 }
             }
 
             @Override
             public void processTerminated(ProcessEvent event) {
                 LOG.info(prefix + "terminated with exit code " + event.getExitCode());
+                System.out.println(prefix + "terminated with exit code " + event.getExitCode());
             }
         });
 
@@ -243,8 +414,8 @@ public final class DockerManager implements Disposable {
 
     private void updateUi(double x, double y) {
         LOG.info(String.format("[AI4SE] Gaze: x=%.3f  y=%.3f", x, y));
-        // For dev only; remove if you don't want console spam during runIde:
         System.out.println("[AI4SE] Gaze: x=" + x + " y=" + y);
+        // TODO: hook this into your ToolWindow instead of just logging
     }
 
     // -------------------- Disposable --------------------
