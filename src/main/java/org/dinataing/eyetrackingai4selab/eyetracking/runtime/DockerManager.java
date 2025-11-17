@@ -1,109 +1,3 @@
-/*
-PEP8-style review for DockerManager (Java code; style notes adapted from Python conventions)
-
-- Line length:
-  Several lines are quite long (e.g., long ProcessBuilder commands, log strings,
-  and method calls). In PEP8 spirit, try to keep lines ≤ 79–99 characters by
-  breaking arguments across multiple lines.
-
-- Function/class documentation:
-  Public methods such as:
-    - startOrBuildAndStartAsync(Project project)
-    - stopAsync(Project project)
-    - startOrBuildAndStart()
-    - stop()
-    - isRunning()
-    - getHostPort()
-  would benefit from explicit Javadoc describing behavior, threading model
-  (EDT vs background), side effects, and error conditions.
-
-- Method naming & responsibility:
-  The method name `startOrBuildAndStart` is a bit redundant and long.
-  Consider a clearer name like `ensureContainerRunning` or splitting it into:
-    - buildImageIfNeeded()
-    - startContainer()
-    - ensureDockerEnvironment()
-  to respect single-responsibility and improve testability.
-
-- Long / multi-purpose methods:
-  `startOrBuildAndStart()` currently:
-    * verifies Docker is installed,
-    * stages the Docker context,
-    * computes a hash,
-    * checks/creates an image,
-    * removes stale containers,
-    * chooses a port and OS-specific networking modes,
-    * starts the container,
-    * wires process logs and JSON parsing.
-  This is a lot of behavior for one method. In PEP8 spirit, consider extracting
-  smaller private helpers for each logical step.
-
-- Exception handling:
-  There are several `catch (Exception ignored)` / `catch (IOException ignored)`
-  blocks that swallow errors silently. PEP8 (and good style generally) advises
-  against catching broad exceptions without at least minimal logging.
-  Consider logging at DEBUG level instead of completely ignoring these errors.
-
-- Logging vs printing:
-  The code mixes:
-    - LOG.info / LOG.warn / LOG.debug
-    - System.out.println / System.err.println
-  PEP8 would encourage a single consistent logging mechanism. Prefer the
-  structured logger (`LOG`) everywhere unless console output is explicitly
-  desired for development/debugging only.
-
-- Magic strings and JSON keys:
-  JSON keys like "type", "gaze", "status", "error", "eyeX", "eyeY",
-  "timestamp", "errorType" are used as inline string literals.
-  Consider extracting them as `private static final String` constants to avoid
-  typos and to make refactoring safer.
-
-- OS-specific behavior:
-  The Linux branch uses `--network=host` and sets `hostPort = CONTAINER_PORT`,
-  while non-Linux uses `-p hostPort:CONTAINER_PORT`.
-  Add a brief comment documenting why host networking is required on Linux
-  (e.g., Tobii discovery / device visibility) and why this differs on
-  macOS/Windows.
-
-- Process lifecycle and cleanup:
-  `stop()` calls `runProcess.destroy()` and waits up to 5 seconds. To be more
-  robust, consider falling back to `destroyForcibly()` if the process does not
-  terminate in time, and log any failures in the Docker `stop` call instead of
-  swallowing them.
-
-- JSON parsing responsibilities:
-  The `onTextAvailable` listener handles:
-    * echoing raw log lines,
-    * detecting JSON vs non-JSON,
-    * parsing JSON,
-    * dispatching per-type logic (gaze/status/error).
-  Consider extracting the JSON-specific logic into helpers like:
-    * handleJsonLine(String line)
-    * handleGaze(JSONObject obj)
-    * handleStatus(JSONObject obj)
-    * handleError(JSONObject obj)
-  This will keep the listener simpler and easier to read.
-
-- UI hook:
-  `updateUi(double x, double y)` currently only logs the gaze coordinates.
-  Add a clear TODO comment about how this is intended to integrate with the
-  actual ToolWindow / UI so future maintainers understand its purpose.
-
-- ResourceExtractor usage:
-  The call to `ResourceExtractor.sha256(...)` with specific filenames is good
-  for cache-busting. Consider documenting that changing any of those files
-  will produce a new Docker image tag, which is important for reproducibility.
-
-Overall:
-  The class is conceptually well-structured and readable, but it would benefit
-  from:
-    - smaller, single-purpose private helpers,
-    - consistent logging,
-    - less exception swallowing,
-    - constants for shared strings,
-    - clearer documentation around threading and OS-specific behavior.
-*/
-
 package org.dinataing.eyetrackingai4selab.eyetracking.runtime;
 
 import com.intellij.execution.process.OSProcessHandler;
@@ -216,28 +110,21 @@ public final class DockerManager implements Disposable {
                     .waitFor(3, TimeUnit.SECONDS);
         } catch (Exception ignored) {}
 
-        // Pick a free host port and map -> container:5000
-        hostPort = findFreePort();
-
-        // Run container
-        // Decide how to run Docker based on OS
+        // Decide how to run Docker based on OS (Linux vs others)
         String os = System.getProperty("os.name").toLowerCase();
         List<String> cmd;
 
         if (os.contains("linux")) {
-            // On Linux: use host networking so Tobii discovery can see the device
+            // On Linux: host networking helps Tobii discovery
             cmd = Arrays.asList(
                     "docker", "run", "--rm",
                     "--name", CONTAINER_NAME,
                     "--network=host",
                     imageTag
             );
-
             hostPort = CONTAINER_PORT;
-
             System.out.println("[AI4SE] Starting tracker with --network=host on Linux");
         } else {
-            // Fallback for macOS/Windows: keep the old port-mapping way
             hostPort = findFreePort();
             cmd = Arrays.asList(
                     "docker", "run", "--rm",
@@ -249,7 +136,6 @@ public final class DockerManager implements Disposable {
         }
 
         String commandLine = String.join(" ", cmd);
-
         ProcessBuilder pb = new ProcessBuilder(cmd);
         pb.redirectErrorStream(true);
         runProcess = pb.start();
@@ -327,26 +213,69 @@ public final class DockerManager implements Disposable {
 
                         switch (type) {
                             case "gaze": {
-                                double x = obj.optDouble("eyeX", Double.NaN);
-                                double y = obj.optDouble("eyeY", Double.NaN);
+                                // New schema from your Python:
+                                // leftX, leftY, leftValidity, leftPupil, leftPupilValidity,
+                                // rightX, rightY, rightValidity, rightPupil, rightPupilValidity
+                                double leftX  = obj.optDouble("leftX", Double.NaN);
+                                double leftY  = obj.optDouble("leftY", Double.NaN);
+                                double rightX = obj.optDouble("rightX", Double.NaN);
+                                double rightY = obj.optDouble("rightY", Double.NaN);
+
+                                int leftValidity  = obj.optInt("leftValidity", -1);
+                                int rightValidity = obj.optInt("rightValidity", -1);
+
+                                // Simple strategy: average valid eyes, or fall back to whichever is valid
+                                double gx = Double.NaN;
+                                double gy = Double.NaN;
+
+                                boolean leftValid  = !Double.isNaN(leftX)  && !Double.isNaN(leftY);
+                                boolean rightValid = !Double.isNaN(rightX) && !Double.isNaN(rightY);
+
+                                if (leftValid && rightValid) {
+                                    gx = (leftX + rightX) / 2.0;
+                                    gy = (leftY + rightY) / 2.0;
+                                } else if (leftValid) {
+                                    gx = leftX;
+                                    gy = leftY;
+                                } else if (rightValid) {
+                                    gx = rightX;
+                                    gy = rightY;
+                                }
+
                                 double ts = obj.optDouble("timestamp", Double.NaN);
 
+                                LOG.info(String.format(
+                                        "[AI4SE] Gaze frame ts=%.0f left=(%.3f, %.3f, v=%d) right=(%.3f, %.3f, v=%d) -> avg=(%.3f, %.3f)",
+                                        ts, leftX, leftY, leftValidity, rightX, rightY, rightValidity, gx, gy
+                                ));
+                                System.out.println(String.format(
+                                        "[AI4SE] Gaze frame ts=%.0f left=(%.3f, %.3f) right=(%.3f, %.3f) -> avg=(%.3f, %.3f)",
+                                        ts, leftX, leftY, rightX, rightY, gx, gy
+                                ));
+
+                                double finalGx = gx;
+                                double finalGy = gy;
+
                                 // Thread-safe UI update hook
-                                SwingUtilities.invokeLater(() -> updateUi(x, y));
+                                SwingUtilities.invokeLater(() -> updateUi(finalGx, finalGy));
                                 break;
                             }
+
                             case "status": {
                                 String status = obj.optString("status", "unknown");
                                 LOG.info("[AI4SE] Status from Python: " + status + " -> " + obj);
                                 System.out.println("[AI4SE] Status: " + status + " -> " + obj);
                                 break;
                             }
+
                             case "error": {
                                 String errorType = obj.optString("errorType", "unknown_error");
+                                String msg = obj.optString("message", "");
                                 LOG.warn("[AI4SE] Error from Python: " + errorType + " -> " + obj);
-                                System.err.println("[AI4SE] Python error: " + errorType + " -> " + obj);
+                                System.err.println("[AI4SE] Python error: " + errorType + " -> " + msg);
                                 break;
                             }
+
                             default: {
                                 LOG.info("[AI4SE] Unknown JSON type: " + type + " -> " + obj);
                                 System.out.println("[AI4SE] Unknown JSON type: " + type + " -> " + obj);
@@ -412,9 +341,10 @@ public final class DockerManager implements Disposable {
 
     // -------------------- UI hook (replace with your Tool Window update) --------------------
 
+    /** Receives normalized averaged gaze (0..1 on display) */
     private void updateUi(double x, double y) {
-        LOG.info(String.format("[AI4SE] Gaze: x=%.3f  y=%.3f", x, y));
-        System.out.println("[AI4SE] Gaze: x=" + x + " y=" + y);
+        LOG.info(String.format("[AI4SE] Gaze avg: x=%.3f  y=%.3f", x, y));
+        System.out.println("[AI4SE] Gaze avg: x=" + x + " y=" + y);
         // TODO: hook this into your ToolWindow instead of just logging
     }
 
