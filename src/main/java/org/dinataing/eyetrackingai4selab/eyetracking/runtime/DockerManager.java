@@ -4,13 +4,18 @@ import com.intellij.execution.process.OSProcessHandler;
 import com.intellij.execution.process.ProcessAdapter;
 import com.intellij.execution.process.ProcessEvent;
 import com.intellij.openapi.Disposable;
+import com.intellij.openapi.application.ApplicationManager;
 import com.intellij.openapi.components.Service;
 import com.intellij.openapi.diagnostic.Logger;
 import com.intellij.openapi.progress.ProgressIndicator;
 import com.intellij.openapi.progress.ProgressManager;
 import com.intellij.openapi.progress.Task;
 import com.intellij.openapi.project.Project;
+import com.intellij.openapi.util.Computable;
 import com.intellij.openapi.util.Key;
+import org.dinataing.eyetrackingai4selab.eyetracking.runtime.eyetracker.EyeTracker;
+import org.dinataing.eyetrackingai4selab.eyetracking.runtime.gaze.EditorGazeMapper;
+import org.dinataing.eyetrackingai4selab.eyetracking.runtime.gaze.JsonEyeTrackerMapper;
 import org.jetbrains.annotations.NotNull;
 import org.json.JSONObject;
 
@@ -29,37 +34,49 @@ public final class DockerManager implements Disposable {
     private static final String IMAGE_BASE = "ai4se/eyetracking";
     private static final String CONTAINER_NAME = "ai4se-tracker";
     private static final int CONTAINER_PORT = 5000; // inside the container
-
+    private EyeTracker eyeTracker;
     private Process runProcess;
     private OSProcessHandler runHandler;
     private String imageTag;
     private int hostPort = -1; // chosen dynamically at start
 
+    private Project project;   // needed for editor mapping
+
     // -------------------- Public helpers (EDT-safe) --------------------
 
     /** Non-blocking start/build; safe to call from actions (EDT). */
     public void startOrBuildAndStartAsync(Project project) {
-        ProgressManager.getInstance().run(new Task.Backgroundable(project, "AI4SE: Starting Tracker", false) {
-            @Override public void run(@NotNull ProgressIndicator indicator) {
-                indicator.setIndeterminate(true);
-                try {
-                    startOrBuildAndStart(); // runs off-EDT here
-                } catch (Exception ex) {
-                    LOG.warn("AI4SE start failed", ex);
-                    System.err.println("[AI4SE] Start failed: " + ex.getMessage());
+        this.project = project;
+        ProgressManager.getInstance().run(
+                new Task.Backgroundable(project, "AI4SE: Starting Tracker", false) {
+                    @Override
+                    public void run(@NotNull ProgressIndicator indicator) {
+                        indicator.setIndeterminate(true);
+                        try {
+                            startOrBuildAndStart(); // runs off-EDT here
+                        } catch (Exception ex) {
+                            LOG.warn("AI4SE start failed", ex);
+                            System.err.println("[AI4SE] Start failed: " + ex.getMessage());
+                        }
+                    }
                 }
-            }
-        });
+        );
+    }
+    public void attachEyeTracker(EyeTracker eyeTracker) {
+        this.eyeTracker = eyeTracker;
     }
 
     /** Non-blocking stop; safe to call from actions (EDT). */
     public void stopAsync(Project project) {
-        ProgressManager.getInstance().run(new Task.Backgroundable(project, "AI4SE: Stopping Tracker", false) {
-            @Override public void run(@NotNull ProgressIndicator indicator) {
-                indicator.setIndeterminate(true);
-                stop(); // runs off-EDT here
-            }
-        });
+        ProgressManager.getInstance().run(
+                new Task.Backgroundable(project, "AI4SE: Stopping Tracker", false) {
+                    @Override
+                    public void run(@NotNull ProgressIndicator indicator) {
+                        indicator.setIndeterminate(true);
+                        stop(); // runs off-EDT here
+                    }
+                }
+        );
     }
 
     public synchronized boolean isRunning() {
@@ -152,15 +169,25 @@ public final class DockerManager implements Disposable {
 
         if (isRunning()) {
             runProcess.destroy();
-            try { runProcess.waitFor(5, TimeUnit.SECONDS); } catch (InterruptedException ignored) {}
+            try {
+                runProcess.waitFor(5, TimeUnit.SECONDS);
+            } catch (InterruptedException ignored) {}
             runProcess = null;
         }
-        // Ensure stopped if docker detached for any reason
         try {
             new ProcessBuilder("docker", "stop", CONTAINER_NAME).start();
         } catch (IOException ignored) {}
         hostPort = -1;
         System.out.println("[AI4SE] Tracker stopped.");
+
+        // 👇 NEW: flush XML and cleanup eye tracker
+        if (eyeTracker != null) {
+            try {
+                eyeTracker.stop();
+            } catch (Exception e) {
+                LOG.warn("[AI4SE] Failed to stop EyeTracker", e);
+            }
+        }
     }
 
     // -------------------- Process/log wiring --------------------
@@ -213,9 +240,6 @@ public final class DockerManager implements Disposable {
 
                         switch (type) {
                             case "gaze": {
-                                // New schema from your Python:
-                                // leftX, leftY, leftValidity, leftPupil, leftPupilValidity,
-                                // rightX, rightY, rightValidity, rightPupil, rightPupilValidity
                                 double leftX  = obj.optDouble("leftX", Double.NaN);
                                 double leftY  = obj.optDouble("leftY", Double.NaN);
                                 double rightX = obj.optDouble("rightX", Double.NaN);
@@ -224,12 +248,13 @@ public final class DockerManager implements Disposable {
                                 int leftValidity  = obj.optInt("leftValidity", -1);
                                 int rightValidity = obj.optInt("rightValidity", -1);
 
-                                // Simple strategy: average valid eyes, or fall back to whichever is valid
+                                boolean leftValid  =
+                                        leftValidity == 1 && !Double.isNaN(leftX) && !Double.isNaN(leftY);
+                                boolean rightValid =
+                                        rightValidity == 1 && !Double.isNaN(rightX) && !Double.isNaN(rightY);
+
                                 double gx = Double.NaN;
                                 double gy = Double.NaN;
-
-                                boolean leftValid  = !Double.isNaN(leftX)  && !Double.isNaN(leftY);
-                                boolean rightValid = !Double.isNaN(rightX) && !Double.isNaN(rightY);
 
                                 if (leftValid && rightValid) {
                                     gx = (leftX + rightX) / 2.0;
@@ -248,16 +273,35 @@ public final class DockerManager implements Disposable {
                                         "[AI4SE] Gaze frame ts=%.0f left=(%.3f, %.3f, v=%d) right=(%.3f, %.3f, v=%d) -> avg=(%.3f, %.3f)",
                                         ts, leftX, leftY, leftValidity, rightX, rightY, rightValidity, gx, gy
                                 ));
-                                System.out.println(String.format(
-                                        "[AI4SE] Gaze frame ts=%.0f left=(%.3f, %.3f) right=(%.3f, %.3f) -> avg=(%.3f, %.3f)",
-                                        ts, leftX, leftY, rightX, rightY, gx, gy
-                                ));
 
                                 double finalGx = gx;
                                 double finalGy = gy;
+                                boolean finalLeftValid = leftValid;
+                                boolean finalRightValid = rightValid;
 
-                                // Thread-safe UI update hook
-                                SwingUtilities.invokeLater(() -> updateUi(finalGx, finalGy));
+                                SwingUtilities.invokeLater(() -> {
+                                    if (project == null) {
+                                        return;
+                                    }
+
+                                    if (eyeTracker != null) {
+                                        ApplicationManager.getApplication().runReadAction(
+                                                (Computable<Void>) () -> {
+                                                    eyeTracker.processRawJson(project, obj.toString());
+                                                    return null;
+                                                }
+                                        );
+                                    } else {
+                                        ApplicationManager.getApplication().runReadAction(
+                                                (Computable<Void>) () -> {
+                                                    EditorGazeMapper.mapGazeToEditor(project, finalGx, finalGy);
+                                                    return null;
+                                                }
+                                        );
+                                    }
+                                });
+
+
                                 break;
                             }
 

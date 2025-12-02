@@ -1,4 +1,4 @@
-package org.dinataing.eyetrackingai4selab.eyetracking.runtime.gaze;
+package org.dinataing.eyetrackingai4selab.eyetracking.runtime;
 
 import com.intellij.openapi.diagnostic.Logger;
 import org.json.JSONObject;
@@ -11,6 +11,7 @@ public class PythonJsonStreamParser {
 
     public PythonJsonStreamParser(PythonMessageListener listener) {
         this.listener = listener;
+
     }
 
     /**
