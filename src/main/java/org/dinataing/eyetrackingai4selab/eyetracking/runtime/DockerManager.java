@@ -4,13 +4,16 @@ import com.intellij.execution.process.OSProcessHandler;
 import com.intellij.execution.process.ProcessAdapter;
 import com.intellij.execution.process.ProcessEvent;
 import com.intellij.openapi.Disposable;
+import com.intellij.openapi.application.ApplicationManager;
 import com.intellij.openapi.components.Service;
 import com.intellij.openapi.diagnostic.Logger;
 import com.intellij.openapi.progress.ProgressIndicator;
 import com.intellij.openapi.progress.ProgressManager;
 import com.intellij.openapi.progress.Task;
 import com.intellij.openapi.project.Project;
+import com.intellij.openapi.util.Computable;
 import com.intellij.openapi.util.Key;
+import org.dinataing.eyetrackingai4selab.eyetracking.runtime.eyetracker.EyeTracker;
 import org.dinataing.eyetrackingai4selab.eyetracking.runtime.gaze.EditorGazeMapper;
 import org.dinataing.eyetrackingai4selab.eyetracking.runtime.gaze.JsonEyeTrackerMapper;
 import org.jetbrains.annotations.NotNull;
@@ -31,7 +34,7 @@ public final class DockerManager implements Disposable {
     private static final String IMAGE_BASE = "ai4se/eyetracking";
     private static final String CONTAINER_NAME = "ai4se-tracker";
     private static final int CONTAINER_PORT = 5000; // inside the container
-
+    private EyeTracker eyeTracker;
     private Process runProcess;
     private OSProcessHandler runHandler;
     private String imageTag;
@@ -58,6 +61,9 @@ public final class DockerManager implements Disposable {
                     }
                 }
         );
+    }
+    public void attachEyeTracker(EyeTracker eyeTracker) {
+        this.eyeTracker = eyeTracker;
     }
 
     /** Non-blocking stop; safe to call from actions (EDT). */
@@ -168,12 +174,20 @@ public final class DockerManager implements Disposable {
             } catch (InterruptedException ignored) {}
             runProcess = null;
         }
-        // Ensure stopped if docker detached for any reason
         try {
             new ProcessBuilder("docker", "stop", CONTAINER_NAME).start();
         } catch (IOException ignored) {}
         hostPort = -1;
         System.out.println("[AI4SE] Tracker stopped.");
+
+        // 👇 NEW: flush XML and cleanup eye tracker
+        if (eyeTracker != null) {
+            try {
+                eyeTracker.stop();
+            } catch (Exception e) {
+                LOG.warn("[AI4SE] Failed to stop EyeTracker", e);
+            }
+        }
     }
 
     // -------------------- Process/log wiring --------------------
@@ -266,18 +280,28 @@ public final class DockerManager implements Disposable {
                                 boolean finalRightValid = rightValid;
 
                                 SwingUtilities.invokeLater(() -> {
-                                    // Log basic averaged gaze
-                                  //  updateUi(finalGx, finalGy);
+                                    if (project == null) {
+                                        return;
+                                    }
 
-                                    if (project != null) {
-                                        // 1) averaged gaze → map to editor character
-                                        EditorGazeMapper.mapGazeToEditor(project, finalGx, finalGy);
-//                                        JsonEyeTrackerMapper mapper  = new JsonEyeTrackerMapper(project);
-//                                        mapper.onGazeSample(leftX, leftY, rightX, rightY);
-
-
+                                    if (eyeTracker != null) {
+                                        ApplicationManager.getApplication().runReadAction(
+                                                (Computable<Void>) () -> {
+                                                    eyeTracker.processRawJson(project, obj.toString());
+                                                    return null;
+                                                }
+                                        );
+                                    } else {
+                                        ApplicationManager.getApplication().runReadAction(
+                                                (Computable<Void>) () -> {
+                                                    EditorGazeMapper.mapGazeToEditor(project, finalGx, finalGy);
+                                                    return null;
+                                                }
+                                        );
                                     }
                                 });
+
+
                                 break;
                             }
 

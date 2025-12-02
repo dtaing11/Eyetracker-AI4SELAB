@@ -1,229 +1,181 @@
 package org.dinataing.eyetrackingai4selab.eyetracking.runtime.gaze;
 
 import com.intellij.openapi.application.ApplicationManager;
-import com.intellij.openapi.editor.*;
+import com.intellij.openapi.editor.Editor;
+import com.intellij.openapi.editor.LogicalPosition;
 import com.intellij.openapi.editor.markup.*;
 import com.intellij.openapi.fileEditor.FileEditorManager;
 import com.intellij.openapi.project.Project;
-import com.intellij.openapi.vfs.VirtualFile;
-import com.intellij.psi.*;
-import org.jetbrains.annotations.NotNull;
+import com.intellij.psi.PsiDocumentManager;
+import com.intellij.psi.PsiElement;
+import com.intellij.psi.PsiFile;
+import com.intellij.openapi.util.Computable;
 
 import javax.swing.*;
 import java.awt.*;
 
-/**
- * Maps normalized gaze (0..1) coming from the Tobii/Docker pipeline
- * onto the active editor, and tries to infer:
- *  - which character
- *  - which identifier/word
- *  - which PSI token & its AST context
- *
- * This is a "runtime" version of the EyeTracker logic from the reference project.
- */
-public final class EditorGazeMapper {
+public class EditorGazeMapper {
 
     private static RangeHighlighter currentHighlighter;
 
-    // Small tolerance so slightly off values (gutter, tiny calibration error)
-    // are still treated as "inside" the editor.
-    private static final int MARGIN_X = 40;
-    private static final int MARGIN_Y = 40;
-
-    private EditorGazeMapper() {}
-
     /**
-     * Called from DockerManager when a new averaged gaze point arrives.
+     * Map averaged normalized gaze (0..1 on calibrated display)
+     * to a character in the currently selected editor.
      *
-     * @param project IntelliJ project
-     * @param gx      normalized x in [0,1] (display space)
-     * @param gy      normalized y in [0,1] (display space)
+     * @return GazeHit if successful, null otherwise.
      */
-    public static void mapGazeToEditor(Project project, double gx, double gy) {
-        if (project == null) return;
-        if (Double.isNaN(gx) || Double.isNaN(gy)) return;
+    public static GazeHit mapGazeToEditor(Project project,
+                                          double gx,
+                                          double gy) {
+        if (project == null) return null;
+        if (Double.isNaN(gx) || Double.isNaN(gy)) return null;
 
-        Editor editor = FileEditorManager.getInstance(project).getSelectedTextEditor();
-        if (editor == null) {
-            System.out.println("[AI4SE] No active editor; ignoring gaze.");
-            return;
-        }
+        // 🔒 Everything that touches editor / PSI is now in a read action
+        return ApplicationManager.getApplication().runReadAction(
+                (Computable<GazeHit>) () -> {
 
-        JComponent content = editor.getContentComponent();
+                    Editor editor = FileEditorManager.getInstance(project).getSelectedTextEditor();
+                    if (editor == null) {
+                        System.out.println("[AI4SE] No active editor; ignoring gaze.");
+                        return null;
+                    }
 
-        // 1) normalized → screen coords (same idea as EyeTracker: normalized * screenWidth/Height)
-        Point screenPoint = GazeMapper.gazeToScreenPoint(gx, gy);
-        if (screenPoint == null) {
-            System.out.println("[AI4SE] Gaze is off-screen or monitor index wrong.");
-            return;
-        }
+                    JComponent content = editor.getContentComponent();
 
-        // 2) editor origin on screen
-        Point editorScreenPoint;
-        try {
-            editorScreenPoint = content.getLocationOnScreen();
-        } catch (IllegalComponentStateException e) {
-            System.out.println("[AI4SE] Editor not visible on screen.");
-            return;
-        }
+                    // 1) normalized → screen coords
+                    Point screenPoint = GazeMapper.gazeToScreenPoint(gx, gy);
+                    if (screenPoint == null) {
+                        System.out.println("[AI4SE] Gaze is off-screen or monitor index wrong.");
+                        return null;
+                    }
 
-        int localX = screenPoint.x - editorScreenPoint.x;
-        int localY = screenPoint.y - editorScreenPoint.y;
+                    // 2) editor origin on screen
+                    Point editorScreenPoint;
+                    try {
+                        editorScreenPoint = content.getLocationOnScreen();
+                    } catch (IllegalComponentStateException e) {
+                        System.out.println("[AI4SE] Editor not visible on screen.");
+                        return null;
+                    }
 
-        Rectangle visibleArea = editor.getScrollingModel().getVisibleArea();
+                    int localX = screenPoint.x - editorScreenPoint.x;
+                    int localY = screenPoint.y - editorScreenPoint.y;
+                    Point localPoint = new Point(localX, localY);
 
-        System.out.printf(
-                "[AI4SE][MAP] avg=(%.3f, %.3f) | screen=(%d,%d) | editorTL=(%d,%d) | local=(%d,%d) | visibleArea=(%d,%d,%d,%d) | editorSize=(%d,%d)%n",
-                gx, gy,
-                screenPoint.x, screenPoint.y,
-                editorScreenPoint.x, editorScreenPoint.y,
-                localX, localY,
-                visibleArea.x, visibleArea.y, visibleArea.width, visibleArea.height,
-                content.getWidth(), content.getHeight()
+                    Rectangle visibleArea = editor.getScrollingModel().getVisibleArea();
+
+                    System.out.printf(
+                            "[AI4SE][MAP] avg=(%.3f, %.3f) | screen=(%d,%d) | editorTL=(%d,%d) | local=(%d,%d) | visibleArea=(%d,%d,%d,%d) | editorSize=(%d,%d)%n",
+                            gx, gy,
+                            screenPoint.x, screenPoint.y,
+                            editorScreenPoint.x, editorScreenPoint.y,
+                            localX, localY,
+                            visibleArea.x, visibleArea.y, visibleArea.width, visibleArea.height,
+                            content.getWidth(), content.getHeight()
+                    );
+
+                    // 3) ensure we are inside the editor AND visible text area
+                    if (localX < visibleArea.x || localY < visibleArea.y ||
+                            localX > visibleArea.x + visibleArea.width ||
+                            localY > visibleArea.y + visibleArea.height) {
+                        System.out.println("[AI4SE] Gaze out of text editor visible area.");
+                        return null;
+                    }
+
+                    // 4) local -> logical position
+                    LogicalPosition logicalPos = editor.xyToLogicalPosition(localPoint);
+                    int offset = editor.logicalPositionToOffset(logicalPos);
+                    CharSequence chars = editor.getDocument().getCharsSequence();
+
+                    if (offset < 0 || offset >= chars.length()) {
+                        System.out.println("[AI4SE] Offset out of document range: " + offset);
+                        return null;
+                    }
+
+                    char ch = chars.charAt(offset);
+
+                    // simple “word” extraction around offset
+                    int start = offset;
+                    int end = offset;
+                    while (start > 0 && Character.isJavaIdentifierPart(chars.charAt(start - 1))) {
+                        start--;
+                    }
+                    while (end < chars.length() && Character.isJavaIdentifierPart(chars.charAt(end))) {
+                        end++;
+                    }
+                    String word = chars.subSequence(start, end).toString();
+
+                    System.out.println(
+                            "[AI4SE][GAZE] char='" + ch + "' word=\"" + word + "\" offset=" + offset +
+                                    " (line " + logicalPos.line + ", col " + logicalPos.column + ")"
+                    );
+
+                    // 5) PSI lookup
+                    PsiFile psiFile = PsiDocumentManager.getInstance(project).getPsiFile(editor.getDocument());
+                    PsiElement psiElement = null;
+                    if (psiFile != null) {
+                        psiElement = psiFile.findElementAt(offset);
+                        if (psiElement != null) {
+                            String token = psiElement.getText();
+                            String type = psiElement.getNode().getElementType().toString();
+                            System.out.println("[AI4SE][PSI] token=\"" + token + "\" type=" + type);
+
+                            // Upward AST like your logs
+                            PsiElement parent = psiElement;
+                            int level = 0;
+                            while (parent != null) {
+                                if (parent instanceof PsiFile) break;
+                                LogicalPosition startPos =
+                                        editor.offsetToLogicalPosition(parent.getTextRange().getStartOffset());
+                                LogicalPosition endPos =
+                                        editor.offsetToLogicalPosition(parent.getTextRange().getEndOffset());
+
+                                System.out.printf(
+                                        "[AI4SE][PSI-LEVEL %d] %s | start=%d:%d end=%d:%d%n",
+                                        level,
+                                        parent,
+                                        startPos.line, startPos.column,
+                                        endPos.line, endPos.column
+                                );
+
+                                parent = parent.getParent();
+                                level++;
+                            }
+                        }
+                    }
+
+                    // 6) highlight
+                    highlightChar(editor, offset);
+
+                    // 7) return hit object
+                    return new GazeHit(
+                            gx,
+                            gy,
+                            screenPoint,
+                            editorScreenPoint,
+                            localPoint,
+                            offset,
+                            logicalPos,
+                            ch,
+                            word,
+                            psiElement
+                    );
+                }
         );
-
-        // 3) Filter using visible area + margin (EyeTracker-style)
-        // local coords are in content-space; visibleArea.x/y are scroll offsets in the same space.
-
-// 3) Filter using visible area (NO margin on X to avoid snapping to col 0)
-        boolean outside =
-                (localX < visibleArea.x) ||
-                        (localY < visibleArea.y - MARGIN_Y) ||  // keep small Y margin if you want
-                        (localX > visibleArea.x + visibleArea.width) ||
-                        (localY > visibleArea.y + visibleArea.height + MARGIN_Y);
-
-        if (outside) {
-            System.out.println("[AI4SE] Gaze out of text editor visible area.");
-            return;
-        }
-
-        // DO NOT clamp localX/localY to visibleArea.x / visibleArea.y.
-        // Just pass the raw localPoint to xyToLogicalPosition.
-        Point localPoint = new Point(localX, localY);
-
-
-
-
-        // Everything below must be on EDT because of PSI / editor interaction
-        ApplicationManager.getApplication().invokeLater(() -> mapPointToPsi(project, editor, localPoint, gx, gy, screenPoint));
     }
 
-    /**
-     * Runs on EDT: maps the editor-local point to LogicalPosition, character, word, and PSI element.
-     */
-    private static void mapPointToPsi(Project project,
-                                      Editor editor,
-                                      Point localPoint,
-                                      double gx, double gy,
-                                      Point screenPoint) {
-
-        // 4) local -> logical position (EyeTracker style: editor.xyToLogicalPosition(relativePoint))
-        LogicalPosition logicalPos = editor.xyToLogicalPosition(localPoint);
-        int offset = editor.logicalPositionToOffset(logicalPos);
-
-        CharSequence chars = editor.getDocument().getCharsSequence();
-        if (offset < 0 || offset >= chars.length()) {
-            System.out.println("[AI4SE] Offset out of document range: " + offset);
-            return;
-        }
-
-        // 5) Expand to identifier "word" (similar idea to EyeTracker's token/AST)
-        int start = offset;
-        int end = offset;
-
-        while (start > 0 && Character.isJavaIdentifierPart(chars.charAt(start - 1))) {
-            start--;
-        }
-        while (end < chars.length() && Character.isJavaIdentifierPart(chars.charAt(end))) {
-            end++;
-        }
-
-        String word = chars.subSequence(start, end).toString();
-        char ch = chars.charAt(offset);
-
-        System.out.println(
-                "[AI4SE][GAZE] char='" + ch + "'" +
-                        " word=\"" + word + "\"" +
-                        " offset=" + offset +
-                        " (line " + logicalPos.line + ", col " + logicalPos.column + ")"
-        );
-
-        // 6) Highlight the word for visual feedback (like selecting token)
-        highlightRange(editor, start, end);
-
-        // 7) PSI mapping: token + AST upward traversal (EyeTracker.getASTStructureElement logic)
-        PsiDocumentManager psiDocumentManager = PsiDocumentManager.getInstance(project);
-        PsiFile psiFile = psiDocumentManager.getPsiFile(editor.getDocument());
-        if (psiFile == null) {
-            System.out.println("[AI4SE][PSI] No PsiFile for current document.");
-            return;
-        }
-
-        PsiElement leaf = psiFile.findElementAt(offset);
-        if (leaf == null) {
-            System.out.println("[AI4SE][PSI] No PsiElement at offset " + offset);
-            return;
-        }
-
-        String tokenText = leaf.getText();
-        String tokenType = leaf.getNode() != null ? leaf.getNode().getElementType().toString() : "UNKNOWN";
-
-        System.out.println("[AI4SE][PSI] token=\"" + tokenText + "\" type=" + tokenType);
-
-        // Walk up parents like EyeTracker.getASTStructureElement
-        PsiElement parent = leaf;
-        int levelIdx = 0;
-        while (parent != null && !(parent instanceof PsiFile)) {
-            int startOffset = parent.getTextRange().getStartOffset();
-            int endOffset = parent.getTextRange().getEndOffset();
-            LogicalPosition startLogical = editor.offsetToLogicalPosition(startOffset);
-            LogicalPosition endLogical = editor.offsetToLogicalPosition(endOffset);
-
-            System.out.printf(
-                    "[AI4SE][PSI-LEVEL %d] %s | start=%d:%d end=%d:%d%n",
-                    levelIdx,
-                    parent.toString(),
-                    startLogical.line, startLogical.column,
-                    endLogical.line, endLogical.column
-            );
-
-            parent = parent.getParent();
-            levelIdx++;
-        }
-
-        // You now have:
-        //  - gx, gy (normalized gaze)
-        //  - screenPoint (pixel)
-        //  - localPoint (inside editor)
-        //  - logicalPos (line/col)
-        //  - offset, char, word
-        //  - PSI token + AST chain
-        //
-        // If you want, you can dispatch this to your own listener / logger here
-        // instead of just printing to stdout.
-    }
-
-    // --- Highlighter helpers ---
-
-    private static void highlightRange(@NotNull Editor editor, int start, int end) {
-        MarkupModel markup = editor.getMarkupModel();
-
+    private static void highlightChar(Editor editor, int offset) {
         if (currentHighlighter != null) {
-            markup.removeHighlighter(currentHighlighter);
+            currentHighlighter.dispose();
             currentHighlighter = null;
         }
 
-        if (start >= end) return;
-
-        TextAttributes attrs = new TextAttributes();
-        // Soft yellow, transparent, similar to a selection overlay
-        attrs.setBackgroundColor(new Color(255, 255, 0, 80));
-
-        currentHighlighter = markup.addRangeHighlighter(
-                start,
-                end,
+        MarkupModel markupModel = editor.getMarkupModel();
+        currentHighlighter = markupModel.addRangeHighlighter(
+                offset,
+                offset + 1,
                 HighlighterLayer.SELECTION - 1,
-                attrs,
+                new TextAttributes(null, null, Color.RED, EffectType.BOXED, Font.BOLD),
                 HighlighterTargetArea.EXACT_RANGE
         );
     }

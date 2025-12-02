@@ -5,55 +5,97 @@ import com.intellij.openapi.actionSystem.AnAction;
 import com.intellij.openapi.actionSystem.AnActionEvent;
 import com.intellij.openapi.actionSystem.Presentation;
 import com.intellij.openapi.components.ServiceManager;
+import com.intellij.openapi.project.Project;
 import org.dinataing.eyetrackingai4selab.eyetracking.runtime.DockerManager;
+import org.dinataing.eyetrackingai4selab.eyetracking.runtime.eyetracker.EyeTracker;
 import org.jetbrains.annotations.NotNull;
 
 public class StartStopTrackingAction extends AnAction {
 
-    // The existing actionPerformed method handles the click logic
     @Override
     public void actionPerformed(@NotNull AnActionEvent e) {
         var project = e.getProject();
-        // Use the new way to get a service if your IntelliJ SDK is modern (2020.2+)
-        // DockerManager mgr = project.getService(DockerManager.class);
-        DockerManager mgr = ServiceManager.getService(DockerManager.class);
+        if (project == null) return;
 
-        if (mgr == null) return; // Safety check
+        DockerManager mgr = ServiceManager.getService(DockerManager.class);
+        if (mgr == null) return;
 
         if (!mgr.isRunning()) {
-            mgr.startOrBuildAndStartAsync(project);
+            try {
+                String projectPath = project.getBasePath();
+                if (projectPath == null) {
+                    System.out.println("[AI4SE] Project base path is null");
+                    return;
+                }
+
+                // Data directory: <project>/.ai4se-data
+                java.nio.file.Path dataDir = java.nio.file.Paths.get(projectPath, ".ai4se-data");
+                java.nio.file.Files.createDirectories(dataDir);
+
+                // Current file if any
+                var editor = com.intellij.openapi.fileEditor.FileEditorManager
+                        .getInstance(project)
+                        .getSelectedTextEditor();
+                String filePath = "";
+                if (editor != null) {
+                    var vFile = com.intellij.openapi.fileEditor.FileDocumentManager
+                            .getInstance()
+                            .getFile(editor.getDocument());
+                    if (vFile != null) {
+                        filePath = vFile.getPath();
+                    }
+                }
+
+                // Create + start XML eye tracker
+                EyeTracker eyeTracker = new EyeTracker();
+                eyeTracker.start(project, projectPath, filePath, dataDir.toString());
+                eyeTracker.setRealTime(true);
+                eyeTracker.setGazeHandler(element -> {
+                    String ts = element.getAttribute("timestamp");
+                    String word = element
+                            .getElementsByTagName("location")
+                            .item(0)
+                            .getAttributes()
+                            .getNamedItem("word")
+                            .getNodeValue();
+                    System.out.println("[AI4SE][RT] t=" + ts + " word=" + word);
+                });
+
+                mgr.attachEyeTracker(eyeTracker);
+
+                // Start Docker tracker
+                mgr.startOrBuildAndStartAsync(project);
+
+            } catch (Exception ex) {
+                ex.printStackTrace();
+            }
         } else {
             mgr.stopAsync(project);
         }
     }
 
-    // New update method to handle the dynamic text
+
     @Override
     public void update(@NotNull AnActionEvent e) {
-        // Get the Presentation object which controls the appearance
         final Presentation presentation = e.getPresentation();
+        Project project = e.getProject();
 
-        // Ensure we have a project before proceeding
-        if (e.getProject() == null) {
+        if (project == null) {
             presentation.setEnabledAndVisible(false);
             return;
         }
 
-        // Fetch the DockerManager service
-        DockerManager mgr = ServiceManager.getService(DockerManager.class);
+        DockerManager mgr = project.getService(DockerManager.class);
         if (mgr == null) {
             presentation.setEnabledAndVisible(false);
             return;
         }
 
-        // Determine the text based on the DockerManager's state
         if (mgr.isRunning()) {
-            // If the manager is running, the next action is to STOP it
             presentation.setText("Stop Tracking");
             presentation.setDescription("Stop gaze tracking");
-             presentation.setIcon(AllIcons.Actions.Suspend);
+            presentation.setIcon(AllIcons.Actions.Suspend);
         } else {
-            // If the manager is not running, the next action is to START it
             presentation.setText("Start Tracking");
             presentation.setDescription("Start gaze tracking");
             presentation.setIcon(AllIcons.Actions.Execute);

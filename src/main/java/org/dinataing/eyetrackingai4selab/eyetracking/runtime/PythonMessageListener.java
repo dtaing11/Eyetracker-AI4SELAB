@@ -1,4 +1,4 @@
-package org.dinataing.eyetrackingai4selab.eyetracking.runtime.gaze;
+package org.dinataing.eyetrackingai4selab.eyetracking.runtime;
 
 import org.json.JSONObject;
 
