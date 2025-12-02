@@ -20,15 +20,6 @@
             <add-to-group group-id="ToolsMenu" anchor="first"/>
         </action>
 
-        <!-- Pause / Resume Tracking -->
-        <action id="AI4SE.PauseResumeTracking"
-                class="org.dinataing.eyetrackingai4selab.actions.PauseResumeTrackingAction"
-                text="Pause Tracking"
-                description="Pause or resume gaze tracking">
-            <add-to-group group-id="ToolsMenu"
-                          anchor="after"
-                          relative-to-action="AI4SE.StartStopTracking"/>
-        </action>
         <!-- Add Label popup -->
         <group id="AI4SE.AddLabelActionGroup"
                class="org.dinataing.eyetrackingai4selab.actions.AddLabelActionGroup"

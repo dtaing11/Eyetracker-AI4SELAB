@@ -11,6 +11,7 @@ public class PythonJsonStreamParser {
 
     public PythonJsonStreamParser(PythonMessageListener listener) {
         this.listener = listener;
+
     }
 
     /**
